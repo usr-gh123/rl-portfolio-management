@@ -8,6 +8,8 @@ import tempfile
 import time
 import gym
 import gym.spaces
+import random
+from scipy import stats
 
 from ..config import eps
 from ..data.utils import normalize, random_shift, scale_to_start
@@ -20,7 +22,7 @@ logger = logging.getLogger(__name__)
 class DataSrc(object):
     """Acts as data provider for each new episode."""
 
-    def __init__(self, df, steps=252, scale=True, scale_extra_cols=True, augment=0.00, window_length=50):
+    def __init__(self, steps=252, scale=True, scale_extra_cols=True, augment=0.00, window_length=50):
         """
         DataSrc.
 
@@ -36,64 +38,23 @@ class DataSrc(object):
         self.augment = augment
         self.scale = scale
         self.scale_extra_cols = scale_extra_cols
+        self.asset_names = []
+        self.features = []
         self.window_length = window_length
+        self.gbm = GBM()
 
         # get rid of NaN's
-        df = df.copy()
-        df.replace(np.nan, 0, inplace=True)
-        df = df.fillna(method="pad")
-
-        # dataframe to matrix
-        self.asset_names = df.columns.levels[0].tolist()
-        self.features = df.columns.levels[1].tolist()
-        data = df.as_matrix().reshape(
-            (len(df), len(self.asset_names), len(self.features)))
-        self._data = np.transpose(data, (1, 0, 2))
-        self._times = df.index
-
-        self.price_columns = ['close', 'high', 'low', 'open']
-        self.non_price_columns = set(
-            df.columns.levels[1]) - set(self.price_columns)
-
-        # Stats to let us normalize non price columns
-        if scale_extra_cols:
-            x = self._data.reshape((-1, len(self.features)))
-            self.stats = dict(mean=x.mean(0), std=x.std(0))
-            # for column in self._data.columns.levels[1].tolist():
-            #     x = df.xs(key=column, axis=1, level='Price').as_matrix()[:, :]
-            #     self.stats["mean"].append(x.mean())
-            #      = dict(mean=x.mean(), std=x.std())
-
         self.reset()
 
     def _step(self):
         # get history matrix from dataframe
-        data_window = self.data[:, self.step:self.step +
-                                self.window_length].copy()
-
         # (eq.1) prices
-        y1 = data_window[:, -1, 0] / data_window[:, -2, 0]
-        y1 = np.concatenate([[1.0], y1])  # add cash price
+        data_window = self.data[self.step:self.step+self.window_length+1]
 
-        # (eq 18) X: prices are divided by close price
-        nb_pc = len(self.price_columns)
-        if self.scale:
-            last_close_price = data_window[:, -1, 0]
-            data_window[:, :, :nb_pc] /= last_close_price[:,
-                                                          np.newaxis, np.newaxis]
-
-        if self.scale_extra_cols:
-            # normalize non price columns
-            data_window[:, :, nb_pc:] -= self.stats["mean"][None, None, nb_pc:]
-            data_window[:, :, nb_pc:] /= self.stats["std"][None, None, nb_pc:]
-            data_window[:, :, nb_pc:] = np.clip(
-                data_window[:, :, nb_pc:],
-                self.stats["mean"][nb_pc:] - self.stats["std"][nb_pc:] * 10,
-                self.stats["mean"][nb_pc:] + self.stats["std"][nb_pc:] * 10
-            )
+        y1 = data_window[-1] / data_window[-2]
 
         self.step += 1
-        history = data_window
+        history = data_window[:-1]
         done = bool(self.step >= self.steps)
 
         return history, y1, done
@@ -101,18 +62,10 @@ class DataSrc(object):
     def reset(self):
         self.step = 0
 
-        # get data for this episode
-        self.idx = np.random.randint(
-            low=self.window_length, high=self._data.shape[1] - self.steps)
-        data = self._data[:, self.idx -
-                          self.window_length:self.idx + self.steps + 1].copy()
-        self.times = self._times[self.idx -
-                                 self.window_length:self.idx + self.steps + 1]
-
-        # augment data to prevent overfitting
-        data += np.random.normal(loc=0, scale=self.augment, size=data.shape)
-
-        self.data = data
+        datas = []
+        for i in range(self.window_length + self.steps):
+            datas.append(self.gbm.get_next_value())
+        self.data = random_sequence(self.window_length+self.steps)
 
 
 class PortfolioSim(object):
@@ -125,50 +78,45 @@ class PortfolioSim(object):
     Based of [Jiang 2017](https://arxiv.org/abs/1706.10059)
     """
 
-    def __init__(self, asset_names=[], steps=128, trading_cost=0.0025, time_cost=0.0):
+    def __init__(self, asset_names=[], steps=128, trading_cost=0.0025, time_cost=0.0, mdp_type="MDP"):
         self.cost = trading_cost
         self.time_cost = time_cost
         self.steps = steps
         self.asset_names = asset_names
         self.reset()
+        self.mdp_type = mdp_type
 
     def _step(self, w1, y1):
         """
         Step.
 
-        w1 - new action of portfolio weights - e.g. [0.1,0.9, 0.0]
+        w1 - new action of portfolio weights
         y1 - price relative vector also called return
-            e.g. [1.0, 0.9, 1.1]
         Numbered equations are from https://arxiv.org/abs/1706.10059
         """
         w0 = self.w0
         p0 = self.p0
 
-        dw1 = (y1 * w0) / (np.dot(y1, w0) + eps)  # (eq7) weights evolve into
-
         # (eq16) cost to change portfolio
         # (excluding change in cash to avoid double counting for transaction cost)
-        c1 = self.cost * (
-            np.abs(dw1[1:] - w1[1:])).sum()
+        c1 = self.cost * (np.abs(w0 - w1))
 
-        p1 = p0 * (1 - c1) * np.dot(y1, w0)  # (eq11) final portfolio value
-
-        p1 = p1 * (1 - self.time_cost)  # we can add a cost to holding
-
-        # can't have negative holdings in this model (no shorts)
-        p1 = np.clip(p1, 0, np.inf)
+        p1 = p0 * (1 - c1) * (1-w0 + np.dot(y1, w0))  # (eq11) final portfolio value
 
         rho1 = p1 / p0 - 1  # rate of returns
+
         r1 = np.log((p1 + eps) / (p0 + eps))  # (eq10) log rate of return
-        # (eq22) immediate reward is log rate of return scaled by episode length
-        reward = r1 / self.steps
+        if self.mdp_type == "MMDP":
+            reward = r1
+        else:
+            reward = p1 - p0
 
         # remember for next step
         self.w0 = w1
         self.p0 = p1
 
         # if we run out of money, we're done
-        done = bool(p1 == 0)
+        done = bool(p1 <= 0)
 
         # should only return single values, not list
         info = {
@@ -182,17 +130,16 @@ class PortfolioSim(object):
             "cost": c1,
         }
         # record weights and prices
-        for i, name in enumerate(['BTCBTC'] + self.asset_names):
-            info['weight_' + name] = w1[i]
-            info['price_' + name] = y1[i]
+        info['weight'] = w1
+        info['price'] = y1
 
         self.infos.append(info)
-        return reward, info, done
+        return reward, info, done, p0
 
     def reset(self):
         self.infos = []
-        self.w0 = np.array([1.0] + [0.0] * len(self.asset_names))
-        self.p0 = 1.0
+        self.w0 = np.array([0])
+        self.p0 = np.array([1])
 
 
 class PortfolioEnv(gym.Env):
@@ -238,7 +185,7 @@ class PortfolioEnv(gym.Env):
             scale - scales price data by last opening price on each episode (except return)
             scale_extra_cols - scales non price data using mean and std for whole dataset
         """
-        self.src = DataSrc(df=df, steps=steps, scale=scale, scale_extra_cols=scale_extra_cols,
+        self.src = DataSrc(steps=steps, scale=scale, scale_extra_cols=scale_extra_cols,
                            augment=augment, window_length=window_length)
         self._plot = self._plot2 = self._plot3 = None
         self.output_mode = output_mode
@@ -252,8 +199,7 @@ class PortfolioEnv(gym.Env):
         # openai gym attributes
         # action will be the portfolio weights [cash_bias,w1,w2...] where wn are [0, 1] for each asset
         nb_assets = len(self.src.asset_names)
-        self.action_space = gym.spaces.Box(
-            0.0, 1.0, shape=nb_assets + 1)
+        self.action_space = gym.spaces.Discrete(2)
 
         # get the history space from the data min and max
         if output_mode == 'EIIE':
@@ -269,8 +215,7 @@ class PortfolioEnv(gym.Env):
                 len(self.src.features)
             )
         elif output_mode == 'mlp':
-            obs_shape = (nb_assets) * window_length * \
-                (len(self.src.features))
+            obs_shape = window_length
         else:
             raise Exception('Invalid value for output_mode: %s' %
                             self.output_mode)
@@ -298,21 +243,14 @@ class PortfolioEnv(gym.Env):
         weights = np.clip(action, 0.0, 1.0)
         weights /= weights.sum() + eps
 
-        # Sanity checks
-        assert self.action_space.contains(
-            action), 'action should be within %r but is %r' % (self.action_space, action)
-        np.testing.assert_almost_equal(
-            np.sum(weights), 1.0, 3, err_msg='weights should sum to 1. action="%s"' % weights)
-
         history, y1, done1 = self.src._step()
 
-        reward, info, done2 = self.sim._step(weights, y1)
+        reward, info, done2, p1 = self.sim._step(weights, y1)
 
         # calculate return for buy and hold a bit of each asset
         info['market_value'] = np.cumprod(
             [inf["market_return"] for inf in self.infos + [info]])[-1]
         # add dates
-        info['date'] = self.src.times[self.src.step].timestamp()
         info['steps'] = self.src.step
 
         self.infos.append(info)
@@ -327,7 +265,7 @@ class PortfolioEnv(gym.Env):
         elif self.output_mode == 'mlp':
             history = history.flatten()
 
-        return {'history': history, 'weights': weights}, reward, done1 or done2, info
+        return {'history': history, 'weights': weights, "acc":p1}, reward, done1 or done2, info
 
     def _reset(self):
         self.sim.reset()
@@ -394,3 +332,64 @@ class PortfolioEnv(gym.Env):
 
         if close:
             self._plot = self._plot2 = self._plot3 = None
+
+
+def random_sequence(length, sin_params=[0.1,0.2,0.3,0.6,0.8,2.0], fluctuation_ratio=0.015):
+    def generate_function(index_array):
+        phase = np.random.randint(0, 50)
+        for i in index_array:
+            i = int(i)
+            index_array[i] = 1 + fluctuation_ratio*(sum([np.sin((i+phase)*param) for param in sin_params]))
+        return index_array
+    return np.fromfunction(function=generate_function, shape=(length,))
+
+
+
+class Frequency(object):
+    Second  = 1
+    Minute  = 60
+    Hour    = 60*60
+    Day     = 60*60*24
+
+
+
+class GBM(object):
+    DAYSINYEAR = 252
+    HOURSINYEAR = DAYSINYEAR * 8
+    MINUTESINYEAR = HOURSINYEAR * 60
+    SECONDSINYEAR = MINUTESINYEAR * 60
+
+    # @ interval is in days
+    # @ 1 min frequency is 1/60*24
+    def __init__(self, init_value=1, interval=1.0, freq=Frequency.Day):
+        self.__frequency = freq
+
+        if (self.__frequency == Frequency.Day):
+            self.__interval = float((interval * 1.0) / GBM.DAYSINYEAR)
+        elif (self.__frequency == Frequency.Hour):
+            self.__interval = float((interval * 1.0) / GBM.HOURSINYEAR)
+        elif (self.__frequency == Frequency.Minute):
+            self.__interval = float((interval * 1.0) / GBM.MINUTESINYEAR)
+        elif (self.__frequency == Frequency.Second):
+            self.__interval = float((interval * 1.0) / GBM.SECONDSINYEAR)
+
+        self.__current = init_value
+            #         print ("interval %f" % self.__interval)
+
+    def __getRandom(self):
+        return random.random()
+
+    def get_next_value(self, mean=0.1, std=0.2):
+        # print ("GBM.get_next_value m=%.3f s=%.3f c=%.3f" % (mean,std,currValue))
+        # Geometric Brownian Motion
+        #       return =  drift + shock
+        #         dS_t =  u d_t  +  sigma dW_t
+        #  S_t - S_t-1 = u d_t  +  sigma dW_t
+        #          S_t = S_t-1 + u d_t  +  sigma dW_t
+        next_value = 0.0
+        drift = mean * self.__interval
+        shock = std * stats.norm.ppf(self.__getRandom()) * np.sqrt(self.__interval)
+        next_value = self.__current + drift + shock
+        self.__current = next_value
+        return next_value
+
