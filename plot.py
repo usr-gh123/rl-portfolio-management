@@ -32,7 +32,11 @@ plt.plot(all.mdp, label="MDP",
 #                 alpha=0.3, facecolor='#FF9848',
 #                 linewidth=0)
 plt.xlabel("epochs", font)
+
 plt.ylabel("final capital", font)
-plt.tight_layout()
+plt.subplots_adjust(bottom=.15, left=.15)
 plt.legend(loc="best")
+fig = plt.gcf()
+fig.set_size_inches(5, 3)
+fig.savefig('finexp.png', dpi=100)
 plt.show()
